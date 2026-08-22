@@ -287,3 +287,88 @@ graph.invoke(initial_state)
 
 - **reducer가 왜 필요한가**: 병렬 실행 시 여러 노드가 같은 State 키를 동시에 쓰면 충돌 발생 — reducer로 병합 규칙을 명시적으로 정의해서 해결
 - **Control flow vs Data 구분을 아는 것의 실전 가치**: 디버깅 시 "이 노드가 왜 예상 못한 데이터를 보고 있지?"라는 혼란을 방지하는 핵심 개념. 인터뷰에서 LangGraph 내부 동작 이해도를 보여줄 수 있는 포인트
+
+---
+
+## Conditional Edge — 두 가지 구현 방식
+
+Static edge(Serial/Parallel)는 항상 정해진 경로만 갔지만, Conditional Edge는 **실행 중에 State를 보고 다음 노드를 동적으로 결정**함. 구현 방식은 두 가지, 결과는 동일:
+
+|                          | 방식 A: `add_conditional_edges` + 별도 함수            | 방식 B: `Command` (node가 직접 라우팅) |
+| ------------------------ | ------------------------------------------------------ | -------------------------------------- |
+| 라우팅 로직 위치         | 별도 함수 (`conditional_edge`)                         | 노드 함수(`node_a`) 안에 통합          |
+| 노드 자체가 하는 일      | 아무것도 안 함 (State 안 건드림)                       | State 업데이트 + 라우팅 동시 처리      |
+| 그래프 조립 시 필요한 줄 | `builder.add_conditional_edges("a", conditional_edge)` | 없음 (`node_a`가 스스로 처리하므로)    |
+
+**중요: 두 방식을 절대 동시에 켜면 안 됨.** `node_a`가 이미 `Command`로 라우팅하고 있는데 `add_conditional_edges`까지 걸면, `a`에서 나가는 경로가 이중으로 정의되어 그래프 렌더링 시 `TypeError`(`'<' not supported between NoneType and str`) 발생. 이 둘은 "고르는" 것이지 "합치는" 게 아님.
+
+---
+
+### 방식 A: `add_conditional_edges`
+
+```python
+def node_a(state: State):
+    return   # 아무 업데이트도 안 함 — State는 그대로 통과됨
+
+def conditional_edge(state: State) -> Literal["b", "c", END]:
+    select = state["nlist"][-1]
+    if select == "b": return "b"
+    elif select == "c": return "c"
+    elif select == "q": return END
+    else: return END
+
+builder.add_conditional_edges("a", conditional_edge)
+```
+
+**`node_a`가 빈 함수인 이유**: `node_a`는 데이터 처리가 아니라, 그래프 구조상 "conditional_edge가 실행될 지점"을 만들어주는 역할만 함. `return`만 있고 리턴값이 없으면(=`None`), State는 아무 변화 없이 그대로 다음 단계로 넘어감 — 릴레이로 문서를 넘길 때 아무것도 안 적고 그냥 넘기는 것과 같은 개념.
+
+**`conditional_edge`는 노드가 아님**: `add_node()`로 등록되지 않았기 때문에 그래프상 노드 취급 안 됨. `add_conditional_edges("a", conditional_edge)`로 "a 다음엔 이 함수의 판단을 따르라"고 **등록**만 해두는 것.
+
+**호출 주체는 우리가 아니라 LangGraph**: `conditional_edge(state)`라는 코드를 우리가 직접 쓴 적은 없음. `add_conditional_edges`로 등록해두면, 그래프 실행 중 `a` 노드 처리가 끝나는 시점에 **LangGraph 프레임워크가 자동으로 이 함수를 호출**하고, 그때 현재 State를 인자로 넘겨줌.
+
+---
+
+### 방식 B: `Command`
+
+```python
+def node_a(state: State) -> Command[Literal["b", "c", END]]:
+    select = state["nlist"][-1]
+    if select == "b": next_node = "b"
+    elif select == "c": next_node = "c"
+    elif select == "q": next_node = END
+    else: next_node = END
+    return Command(
+        update = State(nlist = [select]),
+        goto = [next_node]
+    )
+```
+
+**`Command`란**: LangGraph가 제공하는 클래스. State 업데이트와 "다음 노드 지정"을 하나의 객체로 묶어서 리턴할 수 있게 해줌.
+
+**`update`, `goto`는 우리가 만든 이름이 아님**: `Command` 클래스가 미리 정의해둔 매개변수. `State(nlist=...)`에서 `nlist`는 우리가 직접 정한 필드명이지만, `Command`의 `update`/`goto`는 **라이브러리 쪽에서 이미 이름이 고정된 것** — `Command`를 쓰려면 이 이름 그대로 값을 넣어야 함.
+
+- `update=` → State를 이렇게 바꿔라
+- `goto=` → 다음엔 여기로 가라 (노드 이름 리스트)
+
+**`-> Command[Literal["b", "c", END]]`의 의미**: `Command[...]` 대괄호는 "이 Command가 갈 수 있는 목적지가 b/c/END로 제한된다"는 타입 정보. **그래프 실행 자체엔 영향 없음** — 오직 `draw_mermaid_png()`가 그래프를 시각화할 때 edge를 정확히 그리기 위한 용도. 지워도 그래프는 똑같이 작동하지만 그림만 부정확해짐.
+
+**`goto`의 특이사항**:
+
+- 문자열이 실제 노드 이름과 일치하는지는 **런타임에만 체크됨** (코드 작성 시점엔 오타가 있어도 에러 안 남, 실행해야 드러남)
+- `goto`는 리스트를 받을 수 있어서 **여러 노드를 동시에 지정하면 병렬 실행도 가능** (Lab 2의 병렬 실행과 연결되는 지점)
+
+---
+
+### `select`와 `input()`으로 받은 `user`의 관계
+
+헷갈리기 쉬운 부분이라 정리:
+
+```python
+user = input('b, c, or q to quit: ')   # ① 사용자가 "b" 입력
+input_state = State(nlist = [user])       # ② {"nlist": ["b"]}
+result = graph.invoke(input_state)          # ③ 그래프에 주입
+```
+
+`invoke()`에 넣은 `input_state`가 그래프의 시작 State가 되어 `START → a`로 전달됨. `node_a`(방식 A의 빈 버전이든, 방식 B의 Command 버전이든)를 거치면서 `state["nlist"][-1]`로 그 값을 다시 꺼내는 게 `select`.
+
+**`select`와 `user`는 같은 값**이고, 다만 거쳐온 경로가 다름:
