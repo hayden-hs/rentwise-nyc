@@ -372,3 +372,113 @@ result = graph.invoke(input_state)          # ③ 그래프에 주입
 `invoke()`에 넣은 `input_state`가 그래프의 시작 State가 되어 `START → a`로 전달됨. `node_a`(방식 A의 빈 버전이든, 방식 B의 Command 버전이든)를 거치면서 `state["nlist"][-1]`로 그 값을 다시 꺼내는 게 `select`.
 
 **`select`와 `user`는 같은 값**이고, 다만 거쳐온 경로가 다름:
+
+user (input()으로 직접 받음)
+→ State(nlist=[user])로 포장
+→ graph.invoke()로 그래프에 주입
+→ 노드/조건함수 안에서 state["nlist"][-1]로 다시 꺼냄
+→ 그게 select
+
+`input()`은 "사용자 → Python 변수"로 값을 가져오는 통로, `state["nlist"][-1]`은 "State 딕셔너리 → 함수 내부"로 같은 값을 다시 꺼내는 통로. 완전히 별개의 값이 아니라 **같은 값이 다른 시점에 다른 형태로 다뤄지는 것**.
+
+---
+
+### 디버깅 체크리스트 (실습 중 겪은 에러 기록)
+
+**증상**: `graph.get_graph().draw_mermaid_png()` 호출 시 `TypeError: '<' not supported between instances of 'NoneType' and 'str'`
+
+**원인 1 — 두 방식 동시 사용**: `node_a`가 Command로 이미 라우팅하는데 `add_conditional_edges`도 추가로 걸어서 `a`의 나가는 경로가 이중 정의됨.
+
+**원인 2 — 커널에 이전 버전이 남아있음**: 셀 코드를 주석 처리하고 재실행해도, **Jupyter 커널은 이전에 실행됐던 함수 정의를 메모리에 그대로 유지**함. "코드를 지웠다"가 "메모리에서도 사라졌다"를 의미하지 않음. 함수 정의를 실질적으로 바꾸려면:
+
+1. 셀 코드 자체를 원하는 버전으로 고쳐 쓰기 (주석 처리가 아니라)
+2. 커널 재시작(`Kernel → Restart Kernel`)으로 메모리 초기화
+3. 위에서부터 순서대로 다시 실행
+
+**교훈**: 두 방식(A/B)을 전환하며 실습할 땐, 반드시 (1) `node_a` 정의 자체를 해당 방식에 맞게 고쳐 쓰고 (2) 그래프 조립 코드에서 안 쓰는 방식의 줄은 지우거나 주석 처리하고 (3) 헷갈리면 커널 재시작 후 처음부터 재실행하는 게 가장 확실함.
+
+---
+
+## Lab 3 → RentWise 연결
+
+- Phase 1 확장 시나리오: "HPD API가 404를 리턴하면 → 311 조회로 스킵, 데이터가 있으면 → 정상적으로 HPD 분석 노드로" 같은 로직이 Conditional Edge 패턴
+- 방식 선택 기준: 라우팅 로직이 단순하고 노드와 밀접하면 Command, 라우팅 로직을 여러 곳에서 재사용하거나 노드 로직과 분리해 테스트하고 싶으면 `add_conditional_edges` — RentWise 규모에서는 아직 어느 쪽이 유리한지 확정할 단계는 아니지만, 개념상 후자가 "관심사 분리" 원칙에 더 부합
+
+---
+
+## Memory / Checkpointer
+
+지금까지 `graph.invoke()`를 부를 때마다 매번 새로운 State에서 시작했음. Memory는 **서로 다른 invoke 호출 사이에도 State가 이어지게** 만드는 기능.
+
+**세 가지 계층 구조** (위에서 아래로):
+
+| 개념           | 정의                                                                                         |
+| -------------- | -------------------------------------------------------------------------------------------- |
+| **State**      | 각 superstep 시작 시 노드에 공급되고, 끝날 때 업데이트되는 데이터 (Lab 1~3에서 이미 다룬 것) |
+| **Checkpoint** | 매 스텝이 끝날 때마다 그 시점의 State를 저장한 **스냅샷**                                    |
+| **Thread**     | 여러 Checkpoint를 시간순으로 모아놓은 것 = "이 세션의 전체 히스토리"                         |
+
+**Checkpointer의 4가지 이점**:
+
+- **Recover gracefully from failures** — 노드 실패 시 처음부터가 아니라 실패 지점부터 재개
+- **Time travel** — 과거의 정상 시점으로 되감아서 그 지점부터 재시작 가능
+- **Persistent state** — 그래프가 실행 중이 아닐 때도 State가 보존됨
+- **Restore state at any step** — 중단된 실행을 정확히 멈춘 지점부터 재개 (human-in-the-loop과 연결)
+
+**LangGraph 기본 제공 checkpointer 3종**: `InMemorySaver`(RAM, 가장 간단), `PostgresSaver`, `SQLiteSaver`(각각 해당 DB에 영구 저장). 이번 랩은 가장 단순한 `InMemorySaver` 사용.
+
+---
+
+## Memory 구현 코드 (Lab 4)
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+memory = InMemorySaver()                              # 실제 저장소 (인스턴스)
+config = {"configurable": {"thread_id": "1"}}         # "어떤 세션을 쓸지" 지정하는 딕셔너리
+
+graph = builder.compile(checkpointer=memory)          # 컴파일 시 checkpointer 등록
+```
+
+Lab 3 코드와의 **유일한 차이**: `invoke()` 호출 시 `config`를 같이 넘겨줌.
+
+```python
+result = graph.invoke(input_state, config)   # config 추가된 것 외엔 Lab 3과 동일
+```
+
+**동작 원리**: `thread_id`가 같으면 이전 State에 이어붙여짐, `thread_id`가 다르면 완전히 새로운 State에서 시작.
+
+---
+
+## 실습 중 발견한 함정: `memory`와 `config`는 역할이 다름
+
+**증상**: `thread_id`를 `"1"` → `"2"` → 다시 `"1"`로 바꿔가며 실습했는데, `"1"`로 돌아와도 이전 기록이 안 남아있고 매번 새로 시작하는 것처럼 보임.
+
+**원인**: `config` 셀 전체를 다시 실행하면서 `memory = InMemorySaver()` 줄까지 같이 재실행됨. 이 줄이 재실행되는 순간, **기존 기록을 담고 있던 저장소 자체가 통째로 새것(텅 빈 것)으로 교체**됨.
+
+**핵심 구분**:
+| | 역할 | 재실행 시 |
+|---|---|---|
+| `memory = InMemorySaver()` | **실제 저장소 그 자체** (모든 thread의 기록이 여기 담김) | 재실행하면 저장소 전체가 초기화됨 — **노트북에서 딱 한 번만 실행해야 함** |
+| `config = {...}` | 그냥 "이번엔 어떤 thread_id를 쓸지" 알려주는 딕셔너리 | 자유롭게 여러 번 바꿔도 됨 — 오히려 이걸 바꿔야 세션 전환이 됨 |
+
+**올바른 실습 순서**: `memory`와 `graph = builder.compile(...)`는 최초 한 번만 실행하고, 이후 `thread_id`를 바꿀 땐 **`config` 정의 줄만 따로 떼서 그 줄만** 재실행할 것.
+
+---
+
+## Try Next 검증 결과
+
+1. 같은 `thread_id`로 반복 실행 → 값이 누적됨 ✓
+2. `thread_id`를 다른 값으로 바꿈 → 완전히 새로운 State에서 시작 ✓
+3. 이전 `thread_id`로 복귀 → 기존 기록이 그대로 남아있음 ✓ (persistent state 실증)
+
+---
+
+## Lab 4 → RentWise 연결
+
+concepts.md 상단 "Grilling 대비 메모"의 "왜 LangGraph인가" 답변(Checkpointing으로 실패 지점부터 재시도 가능)이 이번 랩에서 실제 코드로 증명됨.
+
+- Zillow(스텝1) → HPD(스텝2) → 311(스텝3) 각 단계가 끝날 때마다 checkpoint 생성
+- HPD 단계에서 실패해도 Zillow 체크포인트는 살아있으므로, 처음부터가 아니라 HPD부터 재시도 가능
+- `thread_id`는 RentWise에서 "사용자별 조회 세션"에 대응시킬 수 있음 — 예: 사용자가 여러 주소를 연달아 조회할 때 각 조회를 별도 `thread_id`로 분리하거나, 하나의 대화 세션 안에서 여러 주소 히스토리를 누적시키는 데 활용 가능
+- Phase 1은 `InMemorySaver`로 충분(휘발성 무방, 단일 세션 테스트 목적). Phase 2에서 RDS 도입 시 `PostgresSaver`로 전환하면 서버 재시작에도 기록이 영구 보존됨 — 이게 "왜 Phase 2에 PostgreSQL을 넣었는가"에 대한 추가 근거로 쓸 수 있음
