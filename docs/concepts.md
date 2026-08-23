@@ -482,3 +482,58 @@ concepts.md 상단 "Grilling 대비 메모"의 "왜 LangGraph인가" 답변(Chec
 - HPD 단계에서 실패해도 Zillow 체크포인트는 살아있으므로, 처음부터가 아니라 HPD부터 재시도 가능
 - `thread_id`는 RentWise에서 "사용자별 조회 세션"에 대응시킬 수 있음 — 예: 사용자가 여러 주소를 연달아 조회할 때 각 조회를 별도 `thread_id`로 분리하거나, 하나의 대화 세션 안에서 여러 주소 히스토리를 누적시키는 데 활용 가능
 - Phase 1은 `InMemorySaver`로 충분(휘발성 무방, 단일 세션 테스트 목적). Phase 2에서 RDS 도입 시 `PostgresSaver`로 전환하면 서버 재시작에도 기록이 영구 보존됨 — 이게 "왜 Phase 2에 PostgreSQL을 넣었는가"에 대한 추가 근거로 쓸 수 있음
+
+---
+
+## Interrupt / Human-in-the-loop
+
+지금까지는 그래프가 한 번 실행되면 끝까지 자동으로 진행됐음. Interrupt는 **실행 도중 특정 노드에서 "사람 확인이 필요하다"고 판단하면 그 자리에서 그래프를 완전히 정지시키고, 사람 응답이 오면 그 지점부터 재개**하는 기능. 대표 사례: 도구 실행 전 승인, DB 쓰기 전 sign-off.
+
+Checkpointer(Lab 4)가 전제 조건 — 정지 시점의 state를 저장해뒀다가 복원하는 게 checkpointer 역할.
+
+### 코드 패턴
+
+```python
+from langgraph.types import Command, interrupt
+
+def node_a(state: State) -> Command[Literal["b", "c", END]]:
+    ...
+    else:  # illegal value
+        admin = interrupt(f"Unexpected input '{select}'")
+        if admin == "continue":
+            next_node = "b"
+        else:
+            next_node = END
+    return Command(update=..., goto=next_node)
+```
+
+```python
+while True:
+    result = graph.invoke(input_state, config)
+
+    if '__interrupt__' in result:
+        msg = result['__interrupt__'][-1].value
+        human = input(f"\n{msg}: ")
+        result = graph.invoke(Command(resume=human), config)
+```
+
+- `interrupt()` 호출 시 그래프 정지 → `result['__interrupt__']`에 메시지(`Interrupt.value`)와 id 담겨 리턴
+- `Command(resume=값)`으로 재호출 시 값이 공급되고 실행 재개 — 반드시 **같은 config(같은 thread_id)**로 호출해야 checkpointer가 정지 상태를 찾음
+
+### 핵심 동작: 노드는 항상 처음부터 재시작됨
+
+resume 시 `interrupt()` 호출 지점부터 이어지는 게 아니라 **노드 함수 전체가 처음부터 재실행**됨. 노드가 클 경우 중간 지점의 모든 intermediate state를 살려두는 비용을 피하기 위한 설계.
+
+재실행돼도 같은 interrupt에 다시 멈추지 않는 이유: LangGraph가 응답을 자동으로 checkpoint하고, 이미 답변된 interrupt를 다시 만나면 저장된 값을 즉시 공급함(스킵). 그래서 한 노드 안에 interrupt가 여러 개 있어도 LangGraph가 순서를 추적함.
+
+**주의**: `interrupt()` 이전 코드는 resume마다 매번 재실행되므로, 부작용 큰 코드(DB 쓰기 등)는 interrupt 이전에 두지 않는 게 안전.
+
+### 기타
+
+- `__interrupt__` 값이 리스트인 이유: 병렬 노드가 각각 interrupt를 걸면 여러 개가 한 리스트에 담길 수 있음
+
+## Lab 5 → RentWise 연결
+
+- Phase 1 스코프에서는 우선순위 낮음 — Zillow→HPD→311이 자동 순차 실행이라 사람 승인 지점이 아직 없음
+- 향후 확장 가능 지점: 매물 데이터가 이상치로 판단될 때 "사람 확인 후 진행" 같은 검수 단계에 적용 가능 (Phase 2 이후 고려)
+- Lab 4의 checkpointer가 Lab 5의 정지/재개 메커니즘의 기반이라는 점에서 두 랩은 같은 인프라를 공유 — RentWise에서 checkpointer를 도입하면 향후 interrupt 기능도 자연스럽게 확장 가능
