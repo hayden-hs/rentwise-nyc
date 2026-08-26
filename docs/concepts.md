@@ -537,3 +537,115 @@ resume 시 `interrupt()` 호출 지점부터 이어지는 게 아니라 **노드
 - Phase 1 스코프에서는 우선순위 낮음 — Zillow→HPD→311이 자동 순차 실행이라 사람 승인 지점이 아직 없음
 - 향후 확장 가능 지점: 매물 데이터가 이상치로 판단될 때 "사람 확인 후 진행" 같은 검수 단계에 적용 가능 (Phase 2 이후 고려)
 - Lab 4의 checkpointer가 Lab 5의 정지/재개 메커니즘의 기반이라는 점에서 두 랩은 같은 인프라를 공유 — RentWise에서 checkpointer를 도입하면 향후 interrupt 기능도 자연스럽게 확장 가능
+
+---
+
+## Lab 6: Email Agent (Build A Workflow) — 종합 실습
+
+Lab 1~5의 모든 개념(State, Node, Edge, 병렬 실행, Conditional routing via Command, Checkpointer, Interrupt)을 하나의 프로덕션 스타일 워크플로우로 조합한 캡스톤 랩.
+
+### 시나리오
+
+고객 이메일 수신 → LLM이 분류 → (문서 검색 + 버그 티켓 생성 병렬) → LLM이 답장 초안 작성 → 긴급도/의도에 따라 사람 검토 필요 여부 자동 판단 → (필요시 interrupt로 정지 후 승인/거부) → 발송
+
+### 그래프 구조
+
+start → read_email → classify_intent
+├→ bug_tracking ─┐
+└→ search_documentation ─┤
+write_response
+├→ human_review ─┬→ send_reply → end
+│ └→ end (거부 시)
+└→ send_reply → end (검토 불필요 시)
+
+### State 설계 — 노드 다이어그램 기준으로 설계
+
+```python
+class EmailClassification(TypedDict):
+    intent: Literal["question", "bug", "billing", "feature", "complex"]
+    urgency: Literal["low", "medium", "high", "critical"]
+    topic: str
+    summary: str
+
+class EmailAgentState(TypedDict):
+    email_content: str          # 입력값
+    sender_email: str           # 입력값
+    email_id: str                # 입력값
+    classification: EmailClassification | None   # classify_intent가 채움
+    ticket_id: str | None                          # bug_tracking이 채움
+    search_results: list[str] | None               # search_documentation이 채움
+    customer_history: dict | None                  # (미사용 노드, 향후 확장용)
+    draft_response: str | None                     # write_response가 채움
+```
+
+**설계 원칙**: 노드 다이어그램을 보면서 "이 노드가 뭘 만들어내야 다음 노드가 쓸 수 있나"를 하나씩 확인하며 필드 추가. 복잡한 결과(분류 결과 4개 필드)는 별도 TypedDict로 분리. 이 에이전트는 이메일 한 통 처리로 스코프가 한정돼서(이전 이메일 기록 누적 불필요) `Annotated`/커스텀 reducer 불필요 — 기본 reducer(덮어쓰기)로 충분.
+
+### 핵심 패턴 1 — 구조화 출력으로 LLM 응답 형식 강제
+
+```python
+structured_llm = llm.with_structured_output(EmailClassification)
+classification = structured_llm.invoke(prompt)   # 곧바로 dict로 리턴
+```
+
+스키마가 형식은 강제하지만 내용 품질은 프롬프트가 좌우함 → 필드를 프롬프트에도 명시하는 게 실무 관행.
+
+### 핵심 패턴 2 — 에러를 크래시 대신 데이터로 전달
+
+```python
+try:
+    search_results = [...]
+except SearchAPIError as e:
+    search_results = [f"Search temporarily unavailable: {str(e)}"]
+```
+
+에이전트는 오래 실행될 수 있으므로 에러로 죽으면 안 됨. 에러를 문자열로 캡처해 다음 노드(LLM)에 넘기면, LLM이 실패를 인지한 채로 대응 가능. RentWise의 Zillow/HPD/311 API 호출에 동일 패턴 적용 예정.
+
+### 핵심 패턴 3 — 디폴트값은 "명확한 플레이스홀더"로
+
+```python
+classification.get('intent', 'unkown')   # 빈 문자열(") 대신 "unknown"
+```
+
+빈 문자열은 LLM이 "값이 없다"를 인식 못 함 → 예측 불가능한 결과로 이어짐. 명확한 기본값이 에이전트를 resilient하게 만듦.
+
+### 핵심 패턴 4 — Command로 조건부 라우팅 + 사람 판단이 필요한 기준
+
+```python
+needs_review = (
+    classification.get('urgency') in ['high', 'critical'] or
+    classification.get('intent') == 'complex'
+)
+```
+
+"긴급해서"뿐 아니라 "LLM이 카테고리 분류에 확신 못 해서"(`complex`)도 human review 트리거. Confidence 낮은 케이스를 사람 검토로 보내는 패턴 — RentWise에서 GPT 판정 확신도 낮을 때 적용 고려.
+
+### 핵심 패턴 5 — Interrupt 페이로드는 "의사결정에 필요한 것만"
+
+```python
+human_decision = interrupt({
+    "email_id": ..., "original_email": ..., "draft_response": ...,
+    "urgency": ..., "intent": ..., "action": "..."
+})
+```
+
+state 전체를 던지지 않고 사람이 판단하는 데 필요한 필드만 선별. interrupt는 노드 맨 앞에 배치(재실행 시 앞쪽 코드 재실행 최소화).
+
+### LangGraph Studio로 실행 (노트북 대신 UI 데모)
+
+```bash
+cd ~/lca-langgraph-essentials/python
+cp .env ./studio/.
+cd studio
+uv run langgraph dev
+```
+
+- `langgraph.json`이 `email-agent.py:builder`(컴파일 전 StateGraph)를 가리킴 — Studio가 컴파일+checkpointing 자체 관리
+- 브라우저에서 LangSmith 로그인 → Studio UI 진입
+- Input 폼에 `email_content`/`sender_email`/`email_id` 입력 → Submit
+- interrupt 도달 시 자동 정지, 화면에 검토 카드 표시
+- **Resume 값은 반드시 JSON 모드로 입력**: `{"approved": true}` — Text 모드로 넣으면 `AttributeError: 'str' object has no attribute 'get'` 발생 (실제로 겪은 에러)
+- Thread 타임라인에서 각 노드의 입출력(`ticket_id`, `search_results`, `draft_response` 등)을 노드별로 확인 가능 — 병렬 노드(`search_documentation`+`bug_tracking`)가 같은 타임스탬프에 나란히 실행된 것도 시각적으로 확인됨
+
+### 실전 테스트 완료
+
+단일 이메일(urgent billing) → human_review 정지 → JSON resume 승인 → send_reply까지 end-to-end 성공. `__start__`부터 `__end__`까지 전체 경로, 노드별 산출물(ticket_id는 실제 UUID, draft_response는 LLM이 생성한 실제 텍스트) 확인 완료.
