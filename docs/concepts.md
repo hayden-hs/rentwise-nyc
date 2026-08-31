@@ -649,3 +649,12 @@ uv run langgraph dev
 ### 실전 테스트 완료
 
 단일 이메일(urgent billing) → human_review 정지 → JSON resume 승인 → send_reply까지 end-to-end 성공. `__start__`부터 `__end__`까지 전체 경로, 노드별 산출물(ticket_id는 실제 UUID, draft_response는 LLM이 생성한 실제 텍스트) 확인 완료.
+
+## Zillow Agent 구현 중 배운 개념
+
+- **state의 정체**: 함수가 받는 파라미터 이름일 뿐인 딕셔너리. state["키"]로 값 꺼냄. 실행 중간 시점엔 아직 안 채워진 필드가 있을 수 있음 (해당 노드가 아직 안 돌았으니까).
+- **딕셔너리 키에 따옴표 필요한 이유**: 따옴표 없으면 "변수 이름"으로 해석됨. "address"처럼 써야 "글자 자체"로 인식.
+- **노드 리턴 컨벤션**: 각 노드는 자기가 새로 채운 필드만 담은 부분 딕셔너리를 리턴 → LangGraph가 기존 State와 자동 병합. 전체 State를 다시 안 담아도 됨.
+- **class vs def**: 타입(TypedDict) 정의는 class, 함수 정의는 def.
+- **with_structured_output(스키마)**: GPT가 정해진 필드만 가진 dict로 응답하도록 강제. Lab 6 EmailClassification 패턴을 VerdictExplanation에 그대로 적용.
+- **리스트 컴프리헨션**: [comp["rent"] for comp in state["comps"]]는 for loop를 한 줄로 압축한 것.
