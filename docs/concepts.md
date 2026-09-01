@@ -658,3 +658,267 @@ uv run langgraph dev
 - **class vs def**: 타입(TypedDict) 정의는 class, 함수 정의는 def.
 - **with_structured_output(스키마)**: GPT가 정해진 필드만 가진 dict로 응답하도록 강제. Lab 6 EmailClassification 패턴을 VerdictExplanation에 그대로 적용.
 - **리스트 컴프리헨션**: [comp["rent"] for comp in state["comps"]]는 for loop를 한 줄로 압축한 것.
+
+## Zillow Agent — RentCast API 연동 (실습 기록)
+
+### `.env` → 환경변수 → 코드로 이어지는 흐름
+
+```python
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+api_key = os.getenv("RENTCAST_API_KEY")
+```
+
+- `.env` 파일 자체는 그냥 텍스트 파일(`키=값`). 파이썬이 자동으로 읽지 않음
+- `load_dotenv()`: `.env` 내용을 환경변수 공간에 등록 (비유: 봉투를 뜯어 책상 위에 꺼내놓는 행위)
+- `os.getenv("이름")`: 환경변수에서 값을 찾아 리턴, 없으면 `None`
+- 둘은 항상 세트 — `load_dotenv()` 없이 `os.getenv()`만 부르면 아무것도 못 찾음
+- `load_dotenv()`는 함수 안이 아니라 **파일 최상단에서 한 번만** 호출 (여러 함수가 재사용하므로)
+
+---
+
+### OpenAI 전용 클라이언트 vs RentCast raw request — 같은 목적, 다른 방식
+
+|           | `chatbot.py` (OpenAI)                            | Zillow agent (RentCast)                      |
+| --------- | ------------------------------------------------ | -------------------------------------------- |
+| 인증 처리 | 전용 클래스(`OpenAI(api_key=...)`)가 대신 처리   | 전용 SDK 없음 → `headers`에 직접 넣어야 함   |
+| 호출 방식 | `client.chat.completions.create(...)`            | `requests.get(url, headers=..., params=...)` |
+| 응답 형태 | 이미 파싱된 객체 (`.choices[0].message.content`) | 원시 응답 → `.json()`으로 직접 변환 필요     |
+
+**실수 사례**: `RentCast(api_key=...)`라는, 존재하지 않는 클래스를 상상해서 쓴 적 있음. `chatbot.py` 패턴을 그대로 복붙하려 했지만, RentCast는 전용 SDK가 없어서 애초에 그런 클래스가 없었음 → 라이브러리가 "무엇을 대신 해주는지"부터 확인하는 습관 필요.
+
+---
+
+### `requests`로 외부 API 호출하기 — 세 가지 재료
+
+```python
+url = RENTCAST_RENT_ESTIMATE_URL
+params = {"address": state["address"], "bedrooms": state["bedrooms"]}
+headers = {"X-Api-Key": api_key}
+
+response = requests.get(url, params=params, headers=headers)
+response.raise_for_status()
+data = response.json()
+```
+
+- **`params`**: URL 뒤에 붙는 검색 조건(`?키=값&키=값`). 브라우저 검색창의 `?q=검색어`와 같은 개념. 딕셔너리로 넘기면 `requests`가 URL 형식으로 자동 조합
+- **`headers`**: "누가 요청하는지"를 증명하는 인증 정보. API 키는 보안상 URL(`params`)이 아니라 `headers`에 넣는 경우가 많음 (RentCast는 `X-Api-Key`)
+- **`response.json()`**: 원시 응답을 파이썬 딕셔너리로 변환. OpenAI처럼 미리 파싱된 객체를 주지 않으므로 직접 변환 필요
+- **`response.raise_for_status()`**: 상태가 4xx/5xx면 그 자리에서 `HTTPError`를 스스로 던짐 — 없으면 에러 응답도 조용히 넘어가서 디버깅이 어려워짐
+
+---
+
+### `try/except`로 API 실패 대비 — fallback 패턴
+
+```python
+FALLBACK_COMPS: list[CompListing] = [...]
+
+def fetch_comps(state: ZillowAgentState) -> ZillowAgentState:
+    try:
+        ...
+        response.raise_for_status()
+        data = response.json()
+        raw_comps = data.get("comparables", [])
+
+        comps = []
+        for c in raw_comps:
+            comp = {"address": c["formattedAddress"], "rent": c["price"], "bedrooms": c["bedrooms"]}
+            comps.append(comp)
+
+    except requests.exceptions.RequestException as e:
+        print(f"API call failed, using fallback: {e}")
+        return ZillowAgentState(comps=fallback_comps)
+
+    return ZillowAgentState(comps=comps)
+```
+
+- 문법은 `if`/`for`와 동일한 패턴: 콜론(`:`) + 들여쓰기. `{}` 안 씀
+- `RequestException`은 `HTTPError`를 포함하는 더 넓은 범위의 예외 — 인증 에러부터 네트워크 단절까지 폭넓게 커버. 반대로 `HTTPError`는 "서버가 4xx/5xx로 응답한 경우"만 잡는 좁은 범위
+- `as e`로 예외 객체를 변수에 담아야 `print(f"...{e}")`로 실제 에러 내용 확인 가능. `as e` 없이 `e`를 쓰면 `NameError`
+- **분기 설계**: `try`가 끝까지 성공하면 함수 마지막의 `return`, 중간에 실패하면 `except` 안에서 조기 `return` — 함수 전체를 관통하는 하나의 `return`으로 두 경로를 다 처리하려 하면 로직이 꼬임
+
+**실전 검증 (추측 대신 로그로 확인)**: "403일 것이다"라고 짐작만 하고 넘어갈 뻔했으나, `except` 안에 `print(e)`를 넣어 실제 실행해보니 **401 Unauthorized**였음. 짐작이 항상 맞는 건 아니므로, `except` 블록에 로그를 남겨서 실제로 확인하는 습관이 중요.
+
+---
+
+### 디버깅 체크리스트 (직접 겪은 실수들)
+
+**증상 1**: 클래스 이름을 변수명으로 재사용
+
+```python
+CompListing = {"address": ..., ...}   # ✗ 클래스 정의 자체를 덮어씀
+```
+
+→ 다른 변수명(`comp` 등) 사용해야 함
+
+**증상 2**: 딕셔너리 키에 따옴표 누락
+
+```python
+{address: c.formattedAddress}   # ✗ address를 "변수 이름"으로 해석
+{"address": c["formattedAddress"]}   # ✓
+```
+
+**증상 3**: JSON 파싱 결과를 객체처럼 접근
+
+```python
+c.formattedAddress   # ✗ — c는 클래스 인스턴스가 아니라 딕셔너리
+c["formattedAddress"]   # ✓
+```
+
+**증상 4**: 리스트에 `.add()` 사용
+
+```python
+comps.add(comp)   # ✗ .add()는 set 전용 메서드
+comps.append(comp)   # ✓
+```
+
+**증상 5**: `except`에 `as e` 없이 `e` 사용
+
+```python
+except requests.exceptions.RequestException:
+    print(f"...{e}")   # ✗ NameError: name 'e' is not defined
+except requests.exceptions.RequestException as e:
+    print(f"...{e}")   # ✓
+```
+
+**교훈**: 좌변(우리가 지을 키 이름)과 우변(원본 데이터에서 꺼내는 키)은 독립적으로 정할 수 있음. 예: `"rent": c["price"]` — RentCast는 매매든 임대든 가격 필드를 `price`로 통일해서 줌.
+
+---
+
+### RentCast `/avm/rent/long-term` 스펙 요약
+
+| 항목                 | 내용                                                                                            |
+| -------------------- | ----------------------------------------------------------------------------------------------- |
+| 요청 파라미터        | `address`, `bedrooms`, (선택) `bathrooms`, `squareFootage`, `maxRadius`, `daysOld`, `compCount` |
+| 응답 최상위          | `rent`, `rentRangeLow`, `rentRangeHigh`, `subjectProperty`, `comparables`                       |
+| `comparables[]` 필드 | `formattedAddress`, `price`(임대료), `bedrooms`, `distance`, `correlation` 등                   |
+| `CompListing` 매핑   | `address` ← `formattedAddress` / `rent` ← `price` / `bedrooms` ← `bedrooms`                     |
+| 무료 티어            | 월 50건, **카드 등록 필수** (완전 무료 아님 — 결제 화면까지 직접 확인해야 확실히 앎)            |
+
+---
+
+## Grilling 대비 메모 (추가)
+
+- **왜 fallback 구조를 넣었나**: 외부 API는 네트워크 문제, 인증 실패, rate limit 등으로 언제든 실패할 수 있음. 에이전트가 그 자리에서 죽지 않고 안전하게 계속 동작하도록 설계 — Lab 6의 "에러를 크래시 대신 데이터로 전달" 패턴과 동일한 철학
+- **왜 `RequestException`(넓은 범위)을 골랐나**: 지금 당장은 인증 에러(401/403)만 예상되지만, 실제 배포 환경에서는 네트워크 단절, 타임아웃 등 다양한 실패 모드가 있을 수 있어 더 넓은 예외 클래스로 방어
+- **RentCast를 실제로 구독하지 않고도 코드를 완성할 수 있었던 이유**: `try`/`except` 구조 덕분에 API 키 없이도 fallback 경로로 전체 파이프라인(`fetch_comps → compute_stats → explain_verdict`)을 끝까지 검증 가능했음 — 구독 여부와 코드 완성도를 분리해서 진행한 설계 판단
+
+---
+
+## compute_stats 점수 계산식 상세 근거 (HPD)
+
+### violation_score
+
+```
+violation_score = Σ [ (class_weight × status_weight) + rentimpairing_bonus ]
+    class_weight:   C=3, B=2, A=1, I=0      # 위반 등급이 심각할수록 가중치 큼
+    status_weight:  Open=1.5, Close=1.0     # 아직 안 고친 위반에 1.5배 가중
+    rentimpairing_bonus: True → +2, False → +0   # 법적으로 임대료 지급거부 근거가 될 정도면 추가 가산
+```
+
+- `class_weight`와 `status_weight`는 곱셈 관계(같은 위반이 심각하면서 동시에 안 고쳐졌으면 배로 불리해짐), `rentimpairing_bonus`는 덧셈(별도 축이라 곱하면 과도하게 부풀려짐 — 처음엔 곱셈으로 검토했다가 덧셈으로 수정).
+
+### enforcement_score
+
+```
+enforcement_score = Σ [ (1 × active_weight) + amount_bonus ]
+    active_weight:  True → 1.5, False → 1.0
+    amount_bonus (Charges 전용, OMOAwardAmount 실측 분포 기반):
+        $0~$500        → +0.5   (하위 ~58%)
+        $500~$5,000    → +1.5   (중간 ~38%)
+        $5,000~$50,000 → +2.5   (상위 ~4%)
+        $50,000 초과    → +4    (상위 ~0.4%)
+        None           → 0
+    is_landlord_fault == False인 레코드는 0점 (예: "Duplicate OMO", "Vacant Land")
+```
+
+**금액 구간을 실측 기반으로 잡은 이유**: 처음 감으로 잡은 구간($5K/$50K 기준)은 실제 분포(중앙값 $384, 90th percentile $2,700)와 완전히 안 맞았음. `OMOAwardAmount` 컬럼을 pandas로 직접 분석(`describe()`, `quantile()`)해서 실제 분포에 맞는 4구간(회원 건수: 294,286 / 194,494 / 21,688 / 1,958)으로 재조정.
+
+### 소스별 is_active 판단 기준
+
+```
+AEP:        CURRENT_STATUS == "Active"
+Charges:    항상 False
+Litigation: CaseStatus == "PENDING"
+Order:      RESCIND DATE가 비어있음
+```
+
+**Charges가 항상 False인 이유**: `OMOStatusReason` 필드가 공식적으로 "이 OMO가 **종료된** 사유"라고 정의됨. 즉 이 데이터셋은 애초에 종료된 케이스만 기록하는 구조라, "진행 중"이라는 상태 자체가 존재하지 않음. Litigation(`PENDING`/`CLOSED`가 실제로 공존)과 근본적으로 다른 데이터 성격.
+
+### severity_label 임계값 산출
+
+건물 174,370개(Violation Files는 InspectionDate 2025-09-01 이후로 필터링, 약 92.6만 행 / AEP·Charges·Litigation·Orders는 전체 데이터셋) 대상으로 로컬 pandas 분석.
+
+```
+분포: 중앙값 2, 75th 9.5, 90th 45, 95th 100.5, 99th 323, 최댓값 3451.5
+0점(완전 클린) 건물: 17,202개 (9.9%)
+
+기준:
+    5 미만    → "good"     (사소한 위반 1~2건 수준)
+    45 미만   → "caution"
+    45 이상   → "danger"   (90th percentile = 상위 약 10%)
+```
+
+`5`라는 경계값이 계산식과 우연히 맞아떨어지는 지점: Class B(가중치2)+Open(1.5배)=3점에 rentimpairing 보너스(+2)를 더하면 정확히 5점 — "위험 등급 위반이 열려있으면서 법적으로도 심각"한 최소 조건과 일치.
+
+---
+
+## Pandas: 비즈니스 로직 확정 전 실제 데이터 검증하기
+
+- **왜 필요한가**: "감으로" 잡은 임계값이나 구간 경계는 실제 데이터 분포와 비교하기 전까지는 완전히 틀렸을 수 있음. 오늘 실제로 두 번이나 자릿수가 다를 정도로 틀렸던 사례:
+  - Charges 금액 구간을 $5K/$50K로 추측했지만, 실제 분포는 중앙값 $384, 90th percentile이 겨우 $2,700
+  - 파싱 버그 때문에 관측된 최댓값이 $999.99로 보였지만 실제 최댓값은 $7,346,315 (아래 참고)
+- **사용한 패턴**: 구간 경계나 가중치를 정하기 전에 `df[col].describe()` + `df[col].quantile([0.25, 0.5, 0.75, 0.9, 0.99])`로 컬럼의 실제 분포 모양부터 확인.
+
+## `pd.to_numeric(..., errors="coerce")` — 쉼표 포함 숫자의 함정
+
+```python
+df[col] = pd.to_numeric(df[col], errors="coerce")
+```
+
+- `errors="coerce"`: 숫자로 변환 안 되는 값은 에러를 내는 대신 `NaN`으로 바뀜 — 일부 값이 이상해도 나머지는 계속 처리 가능하게 해줌.
+- **함정**: `"1,200"`(천단위 구분 쉼표가 붙은 문자열)은 `pd.to_numeric` 입장에서 유효한 숫자가 아님 — 에러 없이 조용히 `NaN`으로 바뀜. 컬럼의 약 25%가 `NaN`이 됐다면, 그냥 "정상 데이터가 이만큼"이라고 넘기지 말고 **왜** 이렇게 됐는지 확인해야 함.
+- **해결**: 변환 전에 서식 문자 제거
+  ```python
+  df[col] = df[col].astype(str).str.replace(",", "", regex=False)
+  df[col] = pd.to_numeric(df[col], errors="coerce")
+  ```
+- **교훈**: `describe()` 결과가 이상하리만치 깔끔해 보이면(예: 최댓값이 딱 `999.99`로 끝남) 그 자체가 단서임 — 실제 데이터가 우연히 딱 떨어지는 숫자에서 끊기는 경우는 드묾. 이 패턴이 "진짜 데이터 한계"가 아니라 파싱 버그를 가리키는 신호였음.
+
+## 여러 데이터셋에 걸친 그룹핑/합산 (건물 단위 점수 계산)
+
+```python
+violation_score_by_building = violations.groupby("BuildingID")["row_score"].sum()
+enforcement_score = (
+    aep_score.add(charges_score, fill_value=0)
+             .add(litigation_score, fill_value=0)
+             .add(orders_score, fill_value=0)
+)
+total_score = violation_score_by_building.add(enforcement_score, fill_value=0)
+```
+
+- `.groupby(key)[col].sum()` — 행 단위 점수를 건물 하나당 점수 하나로 집계.
+- `.add(other, fill_value=0)` — `+`와 비슷하지만, 한쪽에 없는 건물은 `NaN`이 아니라 `0`으로 처리. 모든 건물이 모든 데이터셋에 다 등장하는 게 아니라서 필요함 (예: 위반은 있지만 AEP 기록은 없는 건물도 있음).
+
+## 서로 다른 데이터 소스에 공통 스키마 설계하기 (`EnforcementRecord`)
+
+- NYC Open Data의 4개 데이터셋(AEP, Charges/OMO, Litigation, Orders)은 컬럼이 거의 전부 다르지만, 개념적으로는 같은 종류의 것(=시가 이 건물에 대해 어떤 강제조치를 취했다)을 나타냄.
+- 4개의 개별 TypedDict를 만드는 대신, 공통 부분집합(`source`, `date`, `description`, `is_active`, `amount`) + 소스 전용 필드(`is_landlord_fault`, Charges에서만 의미 있음)로 필드를 추렸음.
+- **트레이드오프**: 공통 스키마로 통일하면 `compute_stats`가 4개 소스를 소스별 예외 처리 없이 균일하게 순회할 수 있지만, 공통 필드에 안 담기는 소스별 세부 정보는 명시적으로 되살리지 않으면 손실됨(그래서 `amount`, `is_landlord_fault`를 추가했음).
+- **`is_active`가 모든 소스에 깔끔하게 안 맞았던 이유**: Charges/OMO 데이터셋의 `OMOStatusReason` 필드가 공식적으로 "이 OMO가 **종료된** 사유"라고 정의돼 있다는 걸 발견 — 즉 이 데이터셋의 모든 행은 이미 종료된 사건임. "진행 중" 상태를 나타낼 자리가 애초에 없어서 `is_active`가 항상 `False`로 무의미해짐 — 반면 Litigation은 `CaseStatus`가 실제로 `PENDING`과 `CLOSED`를 구분함. 교훈: 4개 소스 중 3개엔 의미 있는데 나머지 하나엔 "해당없음" 처리가 필요한 필드는, 사실 하나의 축이 서로 다른 두 개념(진행상태 vs 종료사유)을 동시에 떠맡고 있다는 신호임 — 그래서 `is_active`에 억지로 두 의미를 다 넣기보다 별도 필드(`is_landlord_fault`)로 분리함.
+
+## "레코드 단위 점수 제외"와 "건물 단위 위반 0건"은 다른 개념
+
+- `EnforcementRecord` 하나는 데이터엔 존재하지만 점수 계산에서 제외될 수 있음(예: `OMOStatusReason == "Duplicate OMO"`) — 그렇다고 그 **건물**이 위반이 없다는 뜻은 아니고, 같은 건물의 다른 레코드는 정상적으로 점수에 반영됨.
+- 건물 단위에서의 결정은 다름: "API 데이터 없음"과 "진짜로 위반 0건"은 **동일하게** 취급함(둘 다 `total_score = 0`) — Phase 1 스코프에서는 그 단계까지 구분 안 하기로 함(대신 `*_fetch_success` 플래그로 별도 추적해서, 점수 계산이 아니라 explain 단계에서 단서를 달 때 씀).
+
+## RentWise 노드 다이어그램 확장: Zillow(3개) → HPD(5개)
+
+| 단계         | 노드                                                                                       | 새로 등장한 개념                                                                                                                                                                                                                                                                                                  |
+| ------------ | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Zillow agent | `fetch_comps → compute_stats → explain_verdict`                                            | Lab 1 직렬 구조, API 실패 시 fallback 데이터                                                                                                                                                                                                                                                                      |
+| HPD agent    | `geocode_address → fetch_violations → fetch_enforcement → compute_stats → explain_verdict` | 여전히 Lab 1 직렬 구조(그래프가 갈라지지 않음) — 다만 `fetch_enforcement` 내부에서 `asyncio.gather`로 4개 API를 동시에 호출함. 이건 **노드 하나 안에서의 Python 레벨 동시성 문제**이지, LangGraph 그래프 레벨의 병렬 브랜치 구조(Lab 2의 reducer 패턴이 필요한 것)가 아님. 그래프 자체는 여전히 하나의 직렬 체인. |
+
+**`geocode_address`를 `fetch_violations`에 합치지 않고 별도 노드로 둔 이유**: 자유 텍스트 주소를 `bbl`로 변환하는 건 위반 기록을 조회하는 것(데이터 조회)과 근본적으로 다른 종류의 작업(지오코딩)이고, `bbl`은 HPD의 5개 데이터셋 **전부**가 필요로 하는 값이라 — 별도로 분리해두면 데이터셋마다 지오코딩을 반복 호출할 필요가 없고, 각 노드의 책임도 하나씩으로 유지됨.

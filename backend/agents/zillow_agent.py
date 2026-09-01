@@ -3,8 +3,10 @@ from typing import TypedDict, Literal
 from langgraph.graph import END, START, StateGraph
 # from IPython.display import Image, display
 from dotenv import load_dotenv
+import os
+import requests
 
-
+RENTCAST_RENT_ESTIMATE_URL = "https://api.rentcast.io/v1/avm/rent/long-term"
 
 class CompListing(TypedDict):
     address: str
@@ -29,6 +31,20 @@ class VerdictExplanation(TypedDict):
     price_explanation: str
     negotiation_comment: str
 
+fallback_comps: list[CompListing] = [{
+        "address": "778, Franklin Ave, Brooklyn, NY, 11234",
+        "rent": 4150,
+        "bedrooms": 2,
+    }, 
+        {"address": "778, Franklin Ave, Brooklyn, NY, 11234",
+        "rent": 4150,
+        "bedrooms": 2,
+    }, 
+        {"address": "778, Franklin Ave, Brooklyn, NY, 11234",
+        "rent": 4150,
+        "bedrooms": 2,
+    }]
+
 load_dotenv()
 
 llm = ChatOpenAI(model="gpt-5-mini")
@@ -36,13 +52,30 @@ llm = ChatOpenAI(model="gpt-5-mini")
 def fetch_comps(state: ZillowAgentState) -> ZillowAgentState:
     print(f"Received input: {state['address']}, {state['user_rent']}, {state['bedrooms']}")
 
-    dummy_comp = {
-        "address": "776, Franklin Ave, Brooklyn, NY, 11238",
-        "rent": 4150,
-        "bedrooms": 2,
-    }
+    try:
+        api_key=os.getenv("RENTCAST_API_KEY")
+        params = {"address": state["address"], "bedrooms": state["bedrooms"]}
+        headers = {"X-Api-Key": api_key}
+        response = requests.get(RENTCAST_RENT_ESTIMATE_URL, params = params, headers = headers)
+        response.raise_for_status()
+        data = response.json()
 
-    return ZillowAgentState(comps=[dummy_comp])
+        raw_comps = data.get("comparables", [])
+
+        comps = []
+
+        for c in raw_comps:
+            comp = {"address": c["formattedAddress"], "rent": c["price"],
+            "bedrooms": c["bedrooms"] }
+
+            comps.append(comp)
+        
+    except requests.exceptions.RequestException as e:
+        print(f"API call failed, using fallback: {e}")
+        return ZillowAgentState(comps=fallback_comps)
+
+
+    return ZillowAgentState(comps=comps)
 
 def compute_stats(state:ZillowAgentState) -> ZillowAgentState:
     rent_list = [comp["rent"] for comp in state["comps"]]
@@ -50,7 +83,7 @@ def compute_stats(state:ZillowAgentState) -> ZillowAgentState:
 
     user_rent = state["user_rent"]
 
-    diff_pct = (user_rent - avg_comp_rent) / avg_comp_rent * 100 # user_rent?이건 어디서 가져와야되는지모르겠음
+    diff_pct = (user_rent - avg_comp_rent) / avg_comp_rent * 100 
 
     if diff_pct > 10:
         verdict_label = "overpriced"
