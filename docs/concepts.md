@@ -922,3 +922,344 @@ total_score = violation_score_by_building.add(enforcement_score, fill_value=0)
 | HPD agent    | `geocode_address → fetch_violations → fetch_enforcement → compute_stats → explain_verdict` | 여전히 Lab 1 직렬 구조(그래프가 갈라지지 않음) — 다만 `fetch_enforcement` 내부에서 `asyncio.gather`로 4개 API를 동시에 호출함. 이건 **노드 하나 안에서의 Python 레벨 동시성 문제**이지, LangGraph 그래프 레벨의 병렬 브랜치 구조(Lab 2의 reducer 패턴이 필요한 것)가 아님. 그래프 자체는 여전히 하나의 직렬 체인. |
 
 **`geocode_address`를 `fetch_violations`에 합치지 않고 별도 노드로 둔 이유**: 자유 텍스트 주소를 `bbl`로 변환하는 건 위반 기록을 조회하는 것(데이터 조회)과 근본적으로 다른 종류의 작업(지오코딩)이고, `bbl`은 HPD의 5개 데이터셋 **전부**가 필요로 하는 값이라 — 별도로 분리해두면 데이터셋마다 지오코딩을 반복 호출할 필요가 없고, 각 노드의 책임도 하나씩으로 유지됨.
+
+---
+
+## f-string 문법
+
+```python
+greeting = f"Hello, {name}!"
+```
+
+- `f"..."` — 문자열 안에 변수/표현식 값을 그대로 끼워 넣는 문법. `"Hello, " + name + "!"`처럼 `+`로 이어붙이는 것과 결과는 같지만 훨씬 읽기 쉬움
+- `{...}` 밖의 따옴표와 안의 따옴표는 서로 다른 언어의 문법일 수 있음 — 예: `f"bbl = '{state['bbl']}'"`에서 바깥 큰따옴표는 Python 문자열 경계, `{...}` 안의 작은따옴표는 Python 딕셔너리 키 접근 문법(`state['bbl']`), `{...}` 밖의 작은따옴표는 Socrata 쿼리 문법(문자열 값을 따옴표로 감싸야 함). 세 가지 문법이 한 줄에 겹쳐 보여서 헷갈리기 쉬움 — 나눠서 읽는 습관 필요
+
+## Socrata 쿼리 (`$where` 필터링)
+
+- Socrata = NYC Open Data 포털(`data.cityofnewyork.us`)이 쓰는 데이터 플랫폼 회사/기술
+- API 기본 호출은 전체 데이터(수백만 건)를 다 돌려주므로, SQL의 `WHERE`절과 비슷한 자체 쿼리 문법으로 필터링 필요:
+  ```python
+  params = {"$where": f"bbl = '{bbl}'"}
+  response = requests.get(url, params=params)
+  ```
+- 다른 Socrata 쿼리 파라미터 예시(아직 안 씀, 참고용): `$limit`(개수 제한), `$order`(정렬), `$select`(컬럼 선택)
+- Socrata API는 RentCast와 달리 `{"comparables": [...]}`처럼 감싸는 딕셔너리가 없고, **응답 자체가 곧바로 리스트**로 옴
+
+## `TypedDict`는 런타임에 강제되지 않음
+
+```python
+class HPDAgentState(ZillowAgentState):
+    bbl: str
+    ...
+
+return HPDAgentState(bbl=bbl, some_undefined_field=True)  # 에러 안 남!
+```
+
+- `TypedDict`에 정의 안 된 키를 넣어서 인스턴스를 만들어도 Python 자체는 에러를 안 냄 — 타입 체커(Pylance 등)만 경고를 띄울 뿐, 실행 시점엔 그냥 평범한 딕셔너리처럼 동작함
+- **교훈**: State 필드를 빠뜨리고 코드를 짜도 조용히 실행되다가, 나중에 다른 노드가 그 필드를 찾으려 할 때(`KeyError`) 원인을 못 찾고 헤맬 수 있음 — 새 필드가 필요해지면 State 클래스 정의부터 먼저 업데이트하는 습관 필요
+
+## Python 3.9에서 `X | None` 문법 에러
+
+```python
+is_landlord_fault: bool | None   # TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'
+```
+
+- `X | None`(Union 타입의 새 문법)은 **Python 3.10 이상 전용**. 3.9 이하에서는 이 문법 자체가 런타임 에러를 냄
+- 해결: `typing.Optional` 사용
+  ```python
+  from typing import Optional
+  is_landlord_fault: Optional[bool]
+  ```
+- 확인 방법: 실행 로그에 찍히는 venv 경로(`.../python3.9/site-packages/...`)로 현재 Python 버전을 알 수 있음
+
+## `import`는 파일 전체를 실행함 — `if __name__ == "__main__":`이 필요한 이유
+
+```python
+# zillow_agent.py 맨 아래
+initial_state = ZillowAgentState(...)
+result = graph.invoke(initial_state)   # 이 줄도 import 시 실행되어버림!
+```
+
+```python
+# hpd_agent.py
+from backend.agents.zillow_agent import ZillowAgentState   # 이 한 줄이 zillow_agent.py 전체를 실행시킴
+```
+
+- Python이 `from A import B`를 실행하면, `B`만 쏙 가져오는 게 아니라 **A 파일 전체를 위에서 아래까지 한 번 실행**함 (클래스 정의, 함수 정의뿐 아니라 그 파일 맨 아래에 있던 실행 코드까지)
+- 그래서 `zillow_agent.py` 맨 아래에 테스트 실행 코드가 그냥 놓여 있으면, `hpd_agent.py`가 그 파일을 import할 때마다 Zillow 파이프라인 전체가 의도치 않게 재실행됨(로그에 관계없는 RentCast 호출/에러가 섞여 나옴)
+- 해결: 테스트/실행 전용 코드를 `if __name__ == "__main__":`으로 감싸기
+  ```python
+  if __name__ == "__main__":
+      initial_state = ZillowAgentState(...)
+      result = graph.invoke(initial_state)
+      print(result)
+  ```
+- 이 블록은 "이 파일을 직접 실행했을 때만" 동작하고, 다른 파일이 import할 때는 건너뛰어짐
+
+## `python 파일경로.py` vs `python -m 패키지.경로`
+
+```bash
+python backend/agents/hpd_agent.py     # ModuleNotFoundError: No module named 'backend'
+python -m backend.agents.hpd_agent     # 정상 동작
+```
+
+- 코드 안에 `from backend.agents.zillow_agent import ...`처럼 **패키지 최상위(`backend`)부터 시작하는 import**가 있으면, Python이 그 `backend`라는 이름을 찾을 수 있는 위치에서 실행해야 함
+- `python 파일경로.py`로 실행하면, Python이 모듈을 찾는 기준 위치가 **그 스크립트가 있는 폴더**가 됨 → `backend/agents/` 안에서 실행되는 셈이라 `backend`라는 폴더 자체가 안 보임
+- `python -m 패키지.경로`로 실행하면, 기준 위치가 **현재 터미널이 있는 위치(보통 프로젝트 루트)**가 됨 → `backend`부터 제대로 찾아짐
+- `-m` 사용 시 문법: `/` 대신 `.`으로 구분, 확장자(`.py`) 안 붙임, 반드시 프로젝트 루트에서 실행
+
+## 동기(sync) vs 비동기(async)
+
+- **동기**: 코드가 한 줄씩 순서대로, 앞이 끝나야 다음이 실행됨. 지금까지 쓴 `requests.get()`이 이 방식 — 응답 올 때까지 그 자리에서 완전히 멈춤
+- **비동기**: 기다리는 동안(예: 네트워크 응답 대기) 다른 작업이 진행되게 양보할 수 있는 방식
+- 왜 필요한가: 서로 무관한 API 호출 여러 개(AEP, Charges, Litigation, Orders)를 동기 방식으로 순서대로 부르면 소요 시간이 그대로 다 더해짐(0.5초×4=2초). 비동기로 동시에 던지면 제일 느린 것 하나 기준(약 0.5초)으로 끝남
+
+## `httpx` — 비동기 지원 HTTP 라이브러리
+
+`requests`는 동기 전용이라 `await`을 못 붙임. 비동기로 API를 부르려면 `httpx` 같은 라이브러리가 필요.
+
+```python
+import httpx
+
+async def fetch_aep(bbl):
+    async with httpx.AsyncClient() as client:
+        params = {"$where": f"bbl = '{bbl}'"}
+        response = await client.get(AEP_URL, params=params)
+        response.raise_for_status()
+        data = response.json()
+        return data
+```
+
+| `requests` (동기)                  | `httpx` (비동기)                                             |
+| ---------------------------------- | ------------------------------------------------------------ |
+| `def fetch(...):`                  | `async def fetch(...):` — 함수 앞에 `async`                  |
+| `requests.get(url, params=params)` | `await client.get(url, params=params)` — `client.` + `await` |
+| (필요 없음)                        | `async with httpx.AsyncClient() as client:` 블록 필요        |
+| `response.raise_for_status()`      | 동일                                                         |
+
+- **`async with httpx.AsyncClient() as client:`**: `with open(file) as f:`와 같은 패턴 — 블록이 끝나면 연결을 자동으로 정리(닫음). `async`가 붙은 이유는 그 "닫는" 과정도 비동기로 처리하기 위함
+- **`await client.get(...)`가 왜 필요한가**: 함수 하나만 떼어놓고 보면 "왜 기다림이 필요하지" 싶을 수 있지만, 이 함수가 `asyncio.gather`로 여러 개 동시에 묶일 때 의미가 생김 — `await`은 "서버 응답 기다리는 동안 다른 코루틴에게 실행 기회를 양보하겠다"는 신호. 이게 없으면(동기 방식이면) 한 함수가 응답 올 때까지 자리를 독점해서, 결국 순차 실행이 되어버림
+
+## `asyncio.gather`로 부분 실패 허용하기
+
+**기본 동작**: 여러 코루틴 중 하나라도 실패하면 즉시 예외를 던지고 나머지 결과까지 다 버려짐.
+
+**`return_exceptions=True`를 추가하면**: 실패해도 예외를 던지지 않고, 그 자리에 예외 객체 자체를 결과로 채워서 끝까지 다 기다린 뒤 리스트로 반환.
+
+```python
+results = await asyncio.gather(
+    fetch_aep(bbl),
+    fetch_charges(bbl),
+    fetch_litigations(bbl),
+    fetch_orders(bbl),
+    return_exceptions=True,
+)
+# 예: Orders만 실패했다면
+# results = [aep결과, charges결과, litigation결과, httpx.HTTPError(...)]
+```
+
+성공/실패를 구분하려면 `isinstance()`로 각 결과가 예외 타입인지 확인:
+
+```python
+if isinstance(results[3], Exception):
+    print("Orders failed")
+else:
+    # results[3]은 진짜 데이터
+```
+
+**HPD에서 이 방식을 택한 이유**: 4개 강제조치 소스 중 하나가 실패해도(네트워크 문제 등) 나머지 3개는 유효한 데이터이므로 살리고 싶었음 — Zillow의 "실패해도 fallback으로 계속 진행" 철학과 같은 맥락.
+
+## 4개 소스를 공통 반복문 대신 개별 블록으로 처리하기로 한 이유
+
+시도했던 방향(실패했던 접근):
+
+```python
+source_names = ["AEP", "Charges", "Litigation", "Order"]
+for i in range(4):
+    if isinstance(results[i], Exception):
+        print(f"{source_names[i]} failed")
+    else:
+        for c in results[i]:
+            record = {"source": source_names[i], "date": c[???], ...}  # 소스마다 원본 필드명이 다 다름
+```
+
+- 문제: AEP는 `AEP_START_DATE`, Charges는 `OMOCreateDate`, Litigation은 `CaseOpenDate`, Orders는 `Vacate Effective Date` — 4개 소스의 원본 필드명이 전부 다르기 때문에, 공통 반복문 하나로는 "date를 어디서 꺼낼지"조차 통일할 수 없음
+- 결론: 실패 여부 체크(`isinstance`)는 4개 다 똑같은 패턴이지만, 성공했을 때의 필드 매핑(변환 로직)은 4개 소스마다 완전히 독립된 블록으로 작성하는 게 더 명확함 — 억지로 하나로 합치려다 오히려 분기 로직이 복잡해지는 경우
+
+## `asyncio.run()`이 필요한 경우
+
+```python
+if __name__ == "__main__":
+    async def test():
+        result = await fetch_aep("3011787503")
+        print(result)
+
+    asyncio.run(test())
+```
+
+- `async def`로 만든 코루틴은 `await`으로만 실행할 수 있는데, 최상위 스크립트 레벨(`if __name__` 블록 등)은 `async` 함수가 아니라서 그 안에서 바로 `await`을 못 씀
+- `asyncio.run(코루틴)`이 "동기 세계에서 비동기 세계로 들어가는 입구" 역할 — 이벤트 루프를 새로 만들어서 그 코루틴을 실행하고 끝나면 루프를 정리함
+
+## [2026-09-27] fetch_enforcement 구현 중 배운 개념
+
+### Socrata 응답은 값이 없으면 키를 아예 뺀다
+
+```python
+c["omostatusreason"]            # 키가 없으면 KeyError로 함수가 죽음
+c.get("omostatusreason", "")    # 키가 없으면 기본값 "" (안전)
+"actual_rescind_date" in c      # 키가 있는지 없는지 자체를 True/False로
+```
+
+- Socrata JSON은 빈 값을 `null`로 주지 않고 **키 자체를 응답에서 뺀다**. 샘플에서 확인: AEP의 `discharge_date`(Active 건), Charges의 `omostatusreason`(3건 중 2건), Orders의 `actual_rescind_date`, Litigation의 `findingofharassment`와 `penalty`
+- 그래서 `fetch_violations`처럼 `c["필드"]`로만 꺼내면 소스에 따라 KeyError가 날 수 있음. 항상 있는 필드는 `c["..."]`, 없을 수 있는 필드는 `c.get(...)` 또는 `in`
+- `.get("키", "")`의 두 번째 인자를 빈 문자열로 주면 뒤에 `.lower()`를 붙여도 안전함 (`None.lower()`는 에러)
+
+**RentWise 연결**: Charges의 `amount`는 `float(c["omoawardamount"]) if "omoawardamount" in c else None`, Orders의 `is_active`는 `"actual_rescind_date" not in c`로 처리
+
+---
+
+### 문서(스키마)와 실제 API 값은 다르다
+
+| 항목                     | 문서                         | 실제 API 응답                                                 |
+| ------------------------ | ---------------------------- | ------------------------------------------------------------- |
+| AEP `current_status`     | "Active" / "Discharged"      | `"AEP Active"` / `"AEP Discharged"`                           |
+| AEP, Orders `bbl` 타입   | Number                       | 따옴표 있는 문자열 (`bbl = '...'` 쿼리가 정상 동작)           |
+| Charges `omoawardamount` | Number (CSV에서는 콤마 버그) | `'556460'`, `'1455.52'` 콤마 없음 (전체 최댓값 검증은 미실시) |
+
+- 웹페이지의 Columns 표는 필드 이름과 설명만 알려줌. **실제 값의 모양은 데이터를 찍어봐야 앎**
+- CSV 다운로드와 API는 같은 데이터셋이어도 형식이 다를 수 있음. pandas 분석 때 쓴 값 비교식(`== "active"`)을 API 코드에 그대로 옮기면 안 됨
+- 처음 테스트한 두 건물에서 4개 소스가 전부 `[]`였던 건 쿼리 오류가 아니라 **진짜 기록이 없어서**였음. 검증법: 각 데이터셋에서 필터 없이 샘플(`$limit`)을 뽑아 그 샘플의 bbl로 다시 호출해서, 결과가 나오면 쿼리는 정상
+
+---
+
+### 데이터 먼저 보기: `$limit`, `$select`, `$group`
+
+```python
+{"$limit": 3}                                                   # 필터 없이 앞의 3건
+{"$select": "omostatusreason, count(*)", "$group": "omostatusreason"}   # 값별 개수 집계
+```
+
+- SQL의 `SELECT ... GROUP BY`와 같은 개념 (SoQL). 서버가 세어서 요약만 보내주므로 수십만 건을 다 받을 필요 없음
+- 집계 결과에서 값이 없는 그룹은 `omostatusreason` 키 없이 `{'count': '7438'}`처럼 나옴
+- "데이터가 설계보다 먼저다" 원칙의 실행 방법. 이 집계로 블랙리스트 9개가 실제로 다 존재하고, 종료 사유가 없는 건이 1.4%임을 확인함
+
+---
+
+### 비교식은 그 자체가 값이다 (`==`, `in`, `not in`)
+
+```python
+"is_active": c["current_status"] == "AEP Active"          # True 또는 False
+"is_active": "actual_rescind_date" not in c               # True 또는 False
+"is_landlord_fault": reason.lower() not in NOT_LANDLORD_FAULT_REASONS
+```
+
+- 틀린 예: `"is_active": c["current_status"]` 는 `'AEP Discharged'`라는 **문자열**이 들어감
+- 파이썬은 내용이 있는 문자열을 전부 참(True)으로 취급하므로, 나중에 `if record["is_active"]:`가 Discharged도 통과시킴. TypedDict는 런타임에 타입을 검사하지 않아서 **에러 없이 점수만 조용히 틀려짐**
+- 값을 복사하는 것과 조건을 평가해서 bool을 만드는 것은 다름
+
+---
+
+### 실패 플래그 변수 (스위치 패턴)
+
+```python
+all_ok = True
+...
+if isinstance(aep_result, Exception):
+    print(f"AEP failed: {aep_result}")
+    all_ok = False          # 4개 블록 모두 실패 분기에서 꺼짐
+...
+return HPDAgentState(hpd_enforcement_records=enforcement_records,
+                     enforcement_fetch_success=all_ok)
+```
+
+- 하나라도 실패하면 `False`로 정함. 일부 소스가 빠진 결과로 점수를 매기면 위험도가 실제보다 낮게 나올 수 있어서, `explain_verdict`가 설명에 단서를 달게 하려는 플래그의 목적과 맞음
+- 리턴할 때 State 키 이름은 정의한 이름과 **글자까지 똑같아야** 함. `hpd_enforce_records`처럼 틀리면 에러 없이 이름이 다른 키가 하나 생기고, 다음 노드는 빈 값을 봄
+
+---
+
+### return과 print
+
+| 상황                                                                  | 쓰는 것  |
+| --------------------------------------------------------------------- | -------- |
+| 다른 코드가 값을 이어서 써야 함 (`fetch_orders`, `fetch_enforcement`) | `return` |
+| 사람이 화면으로 확인만 함 (임시 `sample_test`)                        | `print`  |
+
+- `return`은 값을 넘기면서 함수를 그 자리에서 끝냄. `for` 루프 안에 두면 첫 바퀴에서 함수가 끝남
+- `asyncio.run(코루틴)`은 안의 함수 리턴값을 그대로 돌려줌: `result = asyncio.run(fetch_enforcement(state))`
+
+---
+
+### f-string: 표현식 전체가 중괄호 안
+
+```python
+f"Selected for AEP with {c['of_b_c_violations_at_start']} B/C violations at start"   # 정답
+f"... c{['of_b_c_violations_at_start']} ..."     # 틀림: c는 글자, 대괄호는 리스트가 됨
+f"... 'c.get(casetype)' ..."                     # 틀림: 중괄호가 없어서 글자 그대로 출력
+```
+
+- 바깥이 큰따옴표면 안쪽 키는 작은따옴표 (Python 3.9)
+- 변수와 대괄호, 키까지 표현식 전체가 `{ }` 하나 안에 들어가야 함
+
+---
+
+### 디버깅 노트
+
+| 증상                                    | 원인                                                                      | 해결                                                           |
+| --------------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `NameError: name 'test' is not defined` | `async def test():`는 주석 처리했는데 `asyncio.run(test())`가 살아 있었음 | 블록 전체를 같이 주석 처리                                     |
+| Pylance `aep_result is not defined`     | 변수를 만드는 줄(`aep_result = results[0]`) 없이 사용                     | 변수는 값을 넣어 만든 뒤에 씀                                  |
+| `KeyError: '\tomocreatedate'` (예상)    | 따옴표 안에 눈에 안 보이는 탭 문자가 들어감                               | 따옴표 안을 지우고 손으로 다시 입력. 에러 메시지의 `\t`가 단서 |
+| 프롬프트가 `>>>`로 바뀜                 | 파이썬 REPL(대화형 모드)에 들어감                                         | `exit()` 또는 `Ctrl + D`                                       |
+| 복붙 후 이름이 그대로 남음              | 블록을 복사한 뒤 `for c in aep_result:`, `"source"`, print 라벨을 안 바꿈 | 복사한 블록에서 소스 이름이 들어간 세 곳을 확인                |
+| `results[0]`이 항상 고정                | 반복문 변수 `i`를 안 씀                                                   | 소스별 독립 블록으로 변경                                      |
+
+- 여러 테스트 블록의 `if __name__ == "__main__":`는 전부 순서대로 실행됨. 필요 없는 블록은 `#`로 끄고(`Cmd + /`), 들여쓰기는 `Tab` / `Shift + Tab`
+
+---
+
+### EnforcementRecord 매핑 (4개 소스, 확정)
+
+| 필드                | AEP                              | Charges                 | Litigation                | Order                            |
+| ------------------- | -------------------------------- | ----------------------- | ------------------------- | -------------------------------- |
+| `source`            | `"AEP"`                          | `"Charges"`             | `"Litigation"`            | `"Order"` (단수)                 |
+| `date`              | `aep_start_date`                 | `omocreatedate`         | `caseopendate`            | `vacate_effective_date`          |
+| `description`       | B/C 위반 수를 넣은 문장          | `omodescription`        | `casetype`을 넣은 문장    | 사유와 유형을 넣은 문장          |
+| `is_active`         | `current_status == "AEP Active"` | 항상 `False`            | `casestatus == "PENDING"` | `"actual_rescind_date" not in c` |
+| `is_landlord_fault` | `None`                           | 블랙리스트 기반         | `None`                    | `None`                           |
+| `amount`            | `None`                           | `float(omoawardamount)` | `None`                    | `None`                           |
+
+---
+
+### is_landlord_fault: 블랙리스트 방식
+
+```python
+NOT_LANDLORD_FAULT_REASONS = ["duplicate omo", "utility account picked up by esb", "vacant land",
+    "apt. vacant", "bldg. vacant", "user error", "condition not found",
+    "condition does not exist", "for field visits only - cancelled"]
+
+"is_landlord_fault": c.get("omostatusreason", "").lower() not in NOT_LANDLORD_FAULT_REASONS
+```
+
+- `omostatusreason`은 "이 OMO가 종료된 사유". 블랙리스트 9개 사유는 건물주와 무관하게 끝난 건. 나머지는 전부 `True`, 사유가 없는 건(키 없음)도 `True`
+- 실측 분포(전체 514,093건): 블랙리스트 9개 약 33,100건(6.4%), 사유 없음 7,438건(1.4%), 나머지 약 92%가 `True`
+- 소문자 비교(`.lower()`)를 쓰는 이유: 원본에 `'landlord Restored Service'`처럼 대소문자가 섞인 값이 있음
+- **이 필드는 과실 판정이 아니라 노이즈 필터임.** 데이터셋 자체가 "건물주가 안 고쳐서 HPD가 대신 공사"한 기록이라 대부분 `True`가 정상. `True`는 "건물주 잘못이 입증됨"이 아니라 "제외 사유에 안 걸림"
+
+---
+
+### 알려진 한계 (인터뷰에서 "알고 있고 일정상 이렇게 했다"고 말할 수 있는 것)
+
+1. **블랙리스트 밖의 건물주 무관 사유**: `Tenant Refused Access`(4,097), `Complainant Refused`(4,206), `Condition Different than Stated`(4,775), `Condition Previously Repaired`(34) 등 약 2.6%가 `True`로 남음. 확장하면 good/caution/danger 임계값(5, 45)을 다시 계산해야 해서 Phase 1에서는 9개 유지
+2. **Orders 날짜 역전**: 발효일(2025-10-15)이 철회일(2025-01-07)보다 늦은 레코드가 있음. 날짜 비교 없이 철회일 키 유무만 봄
+3. **원본 `description` 품질**: 약 150자에서 잘리고(`...10:30 am han`), `\x1a`, `ï¿½` 같은 깨진 글자가 섞임. `explain_verdict`에 넘길 때 주의
+4. **Charges `is_active` 항상 False**: 종료 사유가 없는 건이 1.4% 있어서 "종료된 건만 기록"은 근사치. 55만 달러 철거 건도 사유가 없었음
+5. **Litigation `PENDING` 미검증**: 샘플에서는 `CLOSED`만 확인. 진행 중 값이 실제로 `PENDING`인지는 아직 못 봄
+
+---
+
+### 인터뷰 대비
+
+- **Q. 4개 소스를 왜 공통 스키마로 합쳤나?** 소스마다 필드 이름과 의미가 다르지만 "시가 이 건물에 취한 강제조치"라는 같은 개념임. 공통 모양으로 번역해 두면 `compute_stats`가 소스를 신경 쓰지 않고 리스트를 순회하며 점수만 계산함. 대신 공통 필드에 안 담기는 정보(금액, 건물주 과실 여부)는 별도 필드로 살림
+- **Q. API 하나가 실패하면?** `asyncio.gather(..., return_exceptions=True)`로 나머지 결과는 살리고, `enforcement_fetch_success=False`로 표시해 `explain_verdict`가 설명에 단서를 달 수 있게 함
+- **Q. 문서만 보고 짜면 안 되나?** 안 됨. 문서에는 `"Active"`인데 실제는 `"AEP Active"`였고, 값이 없으면 키가 사라지는 것도 문서에 없었음. 샘플과 집계로 실제 값을 먼저 확인함
+- **Q. `is_landlord_fault`는 과실을 판정하나?** 아님. 명백히 건물주와 무관한 9개 종료 사유를 제외하는 노이즈 필터이고, 한계(위 1번)도 알고 있음
