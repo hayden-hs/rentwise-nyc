@@ -125,10 +125,11 @@ graph = builder.compile()
 
 # display(Image(graph.get_graph().draw_mermaid_png()))
 
-initial_state = ZillowAgentState(
-    address="776 Franklin Ave, Brooklyn, NY, 11238",
-    user_rent=4150,
-    bedrooms=2,
-)
-result = graph.invoke(initial_state)
-print(result)
+if __name__ == "__main__":
+    initial_state = ZillowAgentState(
+        address="776 Franklin Ave, Brooklyn, NY, 11238",
+        user_rent=4150,
+        bedrooms=2,
+    )
+    result = graph.invoke(initial_state)
+    print(result)
